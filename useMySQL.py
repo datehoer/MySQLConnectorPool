@@ -2,6 +2,7 @@ import pymysql
 import logging
 import time
 from queue import Queue, Full
+from threading import Lock
 logger = logging.getLogger(__name__)
 
 
@@ -29,8 +30,25 @@ class DatabaseOperationFailed(CustomDatabaseException):
         super().__init__(message, sql=sql, params=params)
 
 
+class EnhancedConnection:
+    def __init__(self, pymysql_conn):
+        self.conn = pymysql_conn
+        self.last_used_time = time.time()
+
+    def __getattr__(self, item):
+        # 代理到原始的 pymysql 连接对象
+        return getattr(self.conn, item)
+
+    def is_valid(self):
+        try:
+            self.conn.ping(reconnect=True)  # 使用 ping 方法检查连接是否存活
+            return True
+        except:
+            return False
+
+
 class MySQLDatabase:
-    def __init__(self, config_mysql, pool_size=10, connect_timeout=5, retry_backoff_base=1.5):
+    def __init__(self, config_mysql, pool_size=10, max_pool_size=20, idle_time=300, connect_timeout=5, retry_backoff_base=1.5, max_retry_delay=120):
         self.host = config_mysql['host']
         self.port = config_mysql['port']
         self.user = config_mysql['user']
@@ -38,9 +56,13 @@ class MySQLDatabase:
         self.db = config_mysql['database']
         self.charset = config_mysql['charset']
         self.pool_size = pool_size
+        self.max_pool_size = max_pool_size
+        self.idle_time = idle_time
         self.connect_timeout = connect_timeout
         self.retry_backoff_base = retry_backoff_base
-        self.pool = Queue(maxsize=pool_size)
+        self.max_retry_delay = max_retry_delay
+        self.pool = Queue(maxsize=max_pool_size)
+        self.lock = Lock()
         for _ in range(pool_size):
             self.pool.put(self.create_conn())
 
@@ -57,7 +79,7 @@ class MySQLDatabase:
                     charset=self.charset,
                     connect_timeout=self.connect_timeout
                 )
-                return conn
+                return EnhancedConnection(conn)
             except pymysql.MySQLError as e:
                 retries -= 1
                 time.sleep(delay)
@@ -67,22 +89,33 @@ class MySQLDatabase:
                     raise DatabaseConnectionError(host=self.host, port=self.port)
 
     def get_conn(self):
-        while True:
-            conn = self.pool.get()
-            try:
-                conn.ping(reconnect=True)
-                return conn
-            except Exception as e:
-                logger.error(f"Connection lost, attempting to reconnect. Error: {e}")
-                conn.close()
-                if self.pool.empty():
-                    return self.create_conn()
+        with self.lock:
+            if self.pool.qsize() < self.pool_size and self.pool.qsize() < self.max_pool_size:
+                try:
+                    self.pool.put_nowait(self.create_conn())
+                except Full:
+                    logger.warning("Connection pool is full. Waiting for an available connection.")
+            elif self.pool.empty():
+                logger.warning("Connection pool is empty. Creating a new connection.")
+                return self.create_conn()
 
-    def release_conn(self, conn):
-        try:
-            self.pool.put_nowait(conn)
-        except Full:
-            conn.close()
+        enhanced_conn = self.pool.get()
+        if not enhanced_conn.is_valid():  # 检查连接有效性
+            enhanced_conn.conn.close()
+            enhanced_conn = self.create_conn()
+        return enhanced_conn
+
+    def release_conn(self, enhanced_conn):
+        if not enhanced_conn.is_valid():  # 检查连接有效性
+            logger.warning("Connection is invalid. Discarding.")
+            enhanced_conn.conn.close()
+            return
+
+        if time.time() - enhanced_conn.last_used_time > self.idle_time or self.pool.qsize() >= self.max_pool_size:
+            logger.info("Closing connection due to idle time or pool size.")
+            enhanced_conn.conn.close()
+        else:
+            self.pool.put_nowait(enhanced_conn)
 
     def execute(self, sql, params=None, retries=3, fetch=False, lastrowid=False):
         delay = self.retry_backoff_base
@@ -101,17 +134,22 @@ class MySQLDatabase:
                 conn.commit()
                 return result
             except pymysql.OperationalError as e:
-                # 捕获连接错误，例如网络问题或服务器中断
                 logger.error(f"Connection error: {e}. Retrying...")
-                # 这里不再需要显式释放连接，因为它可能已经失效
+                retries -= 1
+                if retries <= 0:
+                    raise DatabaseOperationFailed(sql=sql, params=params)
+                time.sleep(delay)
+                delay *= self.retry_backoff_base
             except pymysql.MySQLError as e:
-                # 捕获其它MySQL错误，这些错误通常不需要重试
                 logger.error(f"MySQL error: {e}. SQL: {sql} Params: {params}")
-                raise
+                if conn:
+                    conn.rollback()
+                raise DatabaseOperationFailed(sql=sql, params=params)
             except Exception as e:
-                # 捕获其他类型的异常
                 logger.error(f"Unexpected error: {e}. SQL: {sql} Params: {params}")
-                raise
+                if conn:
+                    conn.rollback()
+                raise DatabaseOperationFailed(sql=sql, params=params)
             finally:
                 if conn:
                     self.release_conn(conn)
@@ -141,5 +179,5 @@ class MySQLDatabase:
 
     def close_all_connections(self):
         while not self.pool.empty():
-            conn = self.pool.get()
+            conn = self.pool.get_nowait()
             conn.close()
