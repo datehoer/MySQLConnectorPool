@@ -31,10 +31,12 @@ class SingletonMeta(type):
     _instances = {}
 
     def __call__(cls, *args, **kwargs):
-        if cls not in cls._instances:
+        config = args[0]
+        config_key = (config['host'], config['port'], config['database'])
+        if config_key not in cls._instances:
             instance = super().__call__(*args, **kwargs)
-            cls._instances[cls] = instance
-        return cls._instances[cls]
+            cls._instances[config_key] = instance
+        return cls._instances[config_key]
 
 
 class MySQLDatabase(metaclass=SingletonMeta):
@@ -47,9 +49,7 @@ class MySQLDatabase(metaclass=SingletonMeta):
         self.db = config_mysql.get('database')
         self.charset = config_mysql.get('charset', 'utf8mb4')
         self.pool_size = pool_size
-        self.cursorclass = config_mysql.get('cursorclass', pymysql.cursors.Cursor) 
-        if config_mysql.get('cursorclass'):
-            self.cursorclass = pymysql.cursors.DictCursor
+        self.cursorclass = pymysql.cursors.DictCursor if config_mysql.get('cursorclass') else pymysql.cursors.Cursor
         self.connect_timeout = connect_timeout
         self.retry_backoff_base = retry_backoff_base
         self.pool = Queue(maxsize=pool_size)
@@ -90,20 +90,43 @@ class MySQLDatabase(metaclass=SingletonMeta):
             self.pool.put_nowait(conn)
         except Full:
             conn.close()
+    
+    def fetch_iter(self, sql, params=[], batch_size=1000, need_per=False):
+        conn = self.get_conn()
+        offset = 0
+        try:
+            while True:
+                true_sql = f"{sql} LIMIT {offset}, {batch_size}"
+                with conn.cursor() as cursor:
+                    cursor.execute(true_sql, params)
+                    results = cursor.fetchall()
+                    if len(results) == 0:
+                        break
+                    if need_per:
+                        for result in results:
+                            yield result
+                    else:
+                        yield results
+                    offset += batch_size
+        except Exception as e:
+            logger.error(f"Database operation error: {e}. SQL executed: {sql} with parameters {params}")
+            raise DatabaseOperationFailed(sql=sql, params=params)
+        finally:
+            conn.rollback()
+            self.release_conn(conn)
 
-    def execute(self, sql, params=None, retries=3, fetch=False, lastrowid=False):
+    def execute(self, sql, params=[], retries=3, lastrowid=False):
         delay = self.retry_backoff_base
         while retries > 0:
             conn = self.get_conn()
             try:
                 with conn.cursor() as cursor:
-                    cursor.execute(sql, params)
-                    if fetch:
-                        result = cursor.fetchall()
+                    if len(params) > 0:
+                        if isinstance(params, (list, tuple)) and isinstance(params[0], (list, tuple)):
+                            cursor.executemany(sql, params)
+                    else:
+                        cursor.execute(sql, params)
                 conn.commit()
-                self.release_conn(conn)
-                if fetch:
-                    return result
                 if lastrowid:
                     return cursor.lastrowid
                 return True
@@ -113,10 +136,11 @@ class MySQLDatabase(metaclass=SingletonMeta):
                 delay *= self.retry_backoff_base  # Increase the delay
                 logger.error(
                     f"Database operation error: {e}. SQL executed: {sql} with parameters {params}. Retries left: {retries}")
-                conn.rollback()
-                self.release_conn(conn)
                 if retries <= 0:
                     raise DatabaseOperationFailed(sql=sql, params=params)
+            finally:
+                conn.rollback()  # Ensure no changes are committed during fetches
+                self.release_conn(conn)
 
     def batch_insert(self, table_name, columns, data_list, batch_size=100):
         placeholders = ', '.join(['%s'] * len(columns))
@@ -124,7 +148,10 @@ class MySQLDatabase(metaclass=SingletonMeta):
         total_count = len(data_list)
         for i in range(0, total_count, batch_size):
             batch_data = data_list[i:i + batch_size]
-            self.execute(sql_base, params=batch_data)
+            try:
+                self.execute(sql_base, params=batch_data)
+            except DatabaseOperationFailed as e:
+                logger.error(f"Batch insert failed: {e}")
 
     def batch_update(self, table_name, columns, data_list, where_column, batch_size=100):
         set_columns = ', '.join([f"{col} = %s" for col in columns])
